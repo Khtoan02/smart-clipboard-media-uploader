@@ -622,7 +622,11 @@ class Smart_Clipboard_Media_Uploader {
 			return $data;
 		}
 
-		$post_id = ! empty( $postarr['ID'] ) ? absint( $postarr['ID'] ) : 0;
+		if ( ! empty( $data['post_type'] ) && 'revision' === $data['post_type'] ) {
+			return $data;
+		}
+
+		$post_id = ! empty( $postarr['ID'] ) ? absint( $postarr['ID'] ) : ( ! empty( $data['ID'] ) ? absint( $data['ID'] ) : 0 );
 		if ( $post_id > 0 && ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) ) {
 			return $data;
 		}
@@ -656,10 +660,14 @@ class Smart_Clipboard_Media_Uploader {
 			'image/webp' => '.webp',
 			'image/avif' => '.avif',
 			'image/gif'  => '.gif',
+			'image/bmp'  => '.bmp',
 		);
 
-		// Tìm tất cả các thẻ <img> chứa src="data:image/..."
-		$pattern = '/<img([^>]*?)src=["\'](data:image\/(png|jpe?g|gif|webp|avif);base64,([A-Za-z0-9+\/=\r\n]+))["\']([^>]*?)>/i';
+		// Giải phóng escape slash trong HTML do WordPress tự động thêm vào $_POST trước khi xử lý
+		$raw_content = wp_unslash( $data['post_content'] );
+
+		// Tìm tất cả các thẻ <img> chứa src="data:image/..." (hỗ trợ mọi định dạng ảnh và cấu trúc thuộc tính)
+		$pattern = '/<img([^>]*?)src=["\'](data:image\/([a-zA-Z0-9\+\-\.]+);base64,([A-Za-z0-9+\/=\s]+))["\']([^>]*?)>/i';
 
 		$img_index = 0;
 		$content = preg_replace_callback( $pattern, function( $matches ) use (
@@ -700,7 +708,7 @@ class Smart_Clipboard_Media_Uploader {
 			$ext = $allowed_mimes_map[ $detected_mime ];
 
 			// Chuyển đổi định dạng sang WebP / AVIF
-			if ( 'original' !== $convert_format && in_array( $detected_mime, array( 'image/png', 'image/jpeg', 'image/gif' ), true ) ) {
+			if ( 'original' !== $convert_format && in_array( $detected_mime, array( 'image/png', 'image/jpeg', 'image/gif', 'image/bmp' ), true ) ) {
 				$converted = $this->convert_image_file( $temp_file, $convert_format, $image_quality );
 				if ( $converted && ! empty( $converted['path'] ) && file_exists( $converted['path'] ) ) {
 					if ( $converted['path'] !== $temp_file ) {
@@ -798,10 +806,12 @@ class Smart_Clipboard_Media_Uploader {
 			}
 
 			return '<img src="' . esc_url( $file_url ) . '" ' . trim( $all_attrs ) . ' />';
-		}, $data['post_content'] );
+		}, $raw_content );
 
 		if ( null !== $content ) {
-			$data['post_content'] = $content;
+			// Quan trọng: WordPress wp_insert_post() luôn chạy wp_unslash($data) ngay sau filter wp_insert_post_data,
+			// nên giá trị trả về trong wp_insert_post_data BẮT BUỘC phải được wp_slash() lại!
+			$data['post_content'] = wp_slash( $content );
 		}
 
 		return $data;
