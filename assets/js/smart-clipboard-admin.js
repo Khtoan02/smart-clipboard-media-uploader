@@ -333,37 +333,35 @@
                     var file = extractImageFromClipboard(e);
                     if (!file) return;
 
-                    // Stop raw base64 insertion!
+                    // Chặn hành vi dán mặc định của trình duyệt
                     e.preventDefault();
                     e.stopPropagation();
 
-                    var tempId = 'smart-paste-' + Date.now();
-                    var placeholderHtml = '<p id="' + tempId + '" class="smart-paste-loading-placeholder">' +
-                        '⏳ Đang tải ảnh từ Clipboard lên Thư viện Media...' +
-                    '</p>';
+                    // Chế độ 1: Chỉ tải lên khi Xuất bản / Lưu bài viết (on_save) - Mặc định & khuyên dùng
+                    if (settings.editorMode === 'on_save') {
+                        var reader = new FileReader();
+                        reader.onload = function(loadEvent) {
+                            var base64Data = loadEvent.target.result;
+                            var previewHtml = '<p><img src="' + base64Data + '" alt="" class="aligncenter size-full smart-paste-pending" /></p>';
+                            editor.insertContent(previewHtml);
+                            editor.fire('change');
 
-                    editor.insertContent(placeholderHtml);
+                            if (settings.showToast) {
+                                showToast('success', 'Đã dán ảnh xem trước', 'Ảnh sẽ tự động nén WebP & tải lên Thư viện khi bạn Xuất bản hoặc Lưu bài viết.');
+                            }
+                        };
+                        reader.readAsDataURL(file);
+                        return;
+                    }
 
+                    // Chế độ 2: Tải lên ngay lập tức khi vừa dán (instant)
                     uploadImageFile(file, {
                         postId: getPostId(),
                         postTitle: getPostTitle(),
                         onSuccess: function(data) {
                             var imgHtml = '<p><img src="' + data.url + '" alt="' + (data.alt || data.title) + '" width="' + data.width + '" height="' + data.height + '" class="aligncenter size-full wp-image-' + data.id + '" /></p>';
-                            var dom = editor.dom;
-                            var targetNode = dom.get(tempId);
-                            if (targetNode) {
-                                dom.replace(editor.dom.create('div', {}, imgHtml), targetNode, true);
-                            } else {
-                                editor.insertContent(imgHtml);
-                            }
+                            editor.insertContent(imgHtml);
                             editor.fire('change');
-                        },
-                        onError: function(errMsg) {
-                            var dom = editor.dom;
-                            var targetNode = dom.get(tempId);
-                            if (targetNode) {
-                                dom.remove(targetNode);
-                            }
                         }
                     });
                 });
@@ -398,6 +396,24 @@
             var textVal = $textarea.val();
             var textBefore = textVal.substring(0, cursorPos);
             var textAfter = textVal.substring(cursorPos);
+
+            if (settings.editorMode === 'on_save') {
+                var reader = new FileReader();
+                reader.onload = function(loadEvent) {
+                    var base64Data = loadEvent.target.result;
+                    var imgTag = '\n<img src="' + base64Data + '" alt="" class="aligncenter size-full smart-paste-pending" />\n';
+                    $textarea.val(textBefore + imgTag + textAfter);
+                    $textarea.prop('selectionStart', cursorPos + imgTag.length);
+                    $textarea.prop('selectionEnd', cursorPos + imgTag.length);
+                    $textarea.trigger('input').trigger('change');
+
+                    if (settings.showToast) {
+                        showToast('success', 'Đã dán ảnh xem trước', 'Ảnh sẽ tự động nén WebP & tải lên Thư viện khi bạn Xuất bản hoặc Lưu bài viết.');
+                    }
+                };
+                reader.readAsDataURL(file);
+                return;
+            }
 
             uploadImageFile(file, {
                 postId: getPostId(),
@@ -446,6 +462,28 @@
             if ($(e.target).closest('.edit-post-visual-editor, .block-editor-writing-flow, .interface-interface-skeleton__content').length || activeEl === document.body) {
                 e.preventDefault();
                 e.stopPropagation();
+
+                if (settings.editorMode === 'on_save') {
+                    var reader = new FileReader();
+                    reader.onload = function(loadEvent) {
+                        var base64Data = loadEvent.target.result;
+                        if (window.wp && wp.blocks && wp.data && wp.data.dispatch) {
+                            var imageBlock = wp.blocks.createBlock('core/image', {
+                                url: base64Data,
+                                alt: '',
+                                caption: '',
+                                className: 'smart-paste-pending'
+                            });
+                            wp.data.dispatch('core/block-editor').insertBlocks(imageBlock);
+
+                            if (settings.showToast) {
+                                showToast('success', 'Đã dán ảnh xem trước', 'Ảnh sẽ tự động nén WebP & tải lên Thư viện khi bạn Xuất bản hoặc Lưu bài viết.');
+                            }
+                        }
+                    };
+                    reader.readAsDataURL(file);
+                    return;
+                }
 
                 uploadImageFile(file, {
                     postId: getPostId(),

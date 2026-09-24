@@ -126,6 +126,9 @@ class Smart_Clipboard_Media_Uploader {
 		// AJAX Upload Handler
 		add_action( 'wp_ajax_smart_clipboard_upload_image', array( $this, 'ajax_upload_image' ) );
 
+		// Tự động xử lý và lưu ảnh dán vào Thư viện Media khi Lưu bài viết / Xuất bản (Chống rác thư viện)
+		add_filter( 'wp_insert_post_data', array( $this, 'process_post_content_base64_images' ), 20, 2 );
+
 		add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), array( $this, 'add_plugin_action_links' ) );
 	}
 
@@ -137,13 +140,14 @@ class Smart_Clipboard_Media_Uploader {
 			'smart_paste_enable_media_library' => array( 'type' => 'boolean', 'default' => 1 ),
 			'smart_paste_enable_editor'        => array( 'type' => 'boolean', 'default' => 1 ),
 			'smart_paste_enable_featured'      => array( 'type' => 'boolean', 'default' => 1 ),
-			'smart_paste_convert_format'       => array( 'type' => 'string',   'default' => 'webp' ),
-			'smart_paste_image_quality'        => array( 'type' => 'integer',  'default' => 82 ),
-			'smart_paste_naming_scheme'        => array( 'type' => 'string',   'default' => 'post_title' ),
-			'smart_paste_custom_prefix'        => array( 'type' => 'string',   'default' => 'pasted-image' ),
-			'smart_paste_auto_alt'             => array( 'type' => 'boolean',  'default' => 1 ),
-			'smart_paste_show_toast'           => array( 'type' => 'boolean',  'default' => 1 ),
-			'smart_paste_play_sound'           => array( 'type' => 'boolean',  'default' => 1 ),
+			'smart_paste_editor_mode'          => array( 'type' => 'string',  'default' => 'on_save' ),
+			'smart_paste_convert_format'       => array( 'type' => 'string',  'default' => 'webp' ),
+			'smart_paste_image_quality'        => array( 'type' => 'integer', 'default' => 82 ),
+			'smart_paste_naming_scheme'        => array( 'type' => 'string',  'default' => 'post_title' ),
+			'smart_paste_custom_prefix'        => array( 'type' => 'string',  'default' => 'pasted-image' ),
+			'smart_paste_auto_alt'             => array( 'type' => 'boolean', 'default' => 1 ),
+			'smart_paste_show_toast'           => array( 'type' => 'boolean', 'default' => 1 ),
+			'smart_paste_play_sound'           => array( 'type' => 'boolean', 'default' => 1 ),
 		);
 
 		foreach ( $options as $opt_name => $opt_args ) {
@@ -218,6 +222,9 @@ class Smart_Clipboard_Media_Uploader {
 			'enableMediaLibrary' => (bool) get_option( 'smart_paste_enable_media_library', 1 ),
 			'enableEditor'       => (bool) get_option( 'smart_paste_enable_editor', 1 ),
 			'enableFeatured'     => (bool) get_option( 'smart_paste_enable_featured', 1 ),
+			'editorMode'         => get_option( 'smart_paste_editor_mode', 'on_save' ),
+			'convertFormat'      => get_option( 'smart_paste_convert_format', 'webp' ),
+			'imageQuality'       => (int) get_option( 'smart_paste_image_quality', 82 ),
 			'namingScheme'       => get_option( 'smart_paste_naming_scheme', 'post_title' ),
 			'customPrefix'       => get_option( 'smart_paste_custom_prefix', 'pasted-image' ),
 			'autoAlt'            => (bool) get_option( 'smart_paste_auto_alt', 1 ),
@@ -599,6 +606,208 @@ class Smart_Clipboard_Media_Uploader {
 	}
 
 	/**
+	 * Tự động quét và tải ảnh Base64 trong nội dung bài viết lên Thư viện Media khi Xuất bản / Lưu bài viết
+	 * Tránh làm phình database và giúp người dùng dán nhầm ảnh không bị tốn dung lượng media.
+	 *
+	 * @param array $data    Mảng dữ liệu bài viết chuẩn bị lưu vào database.
+	 * @param array $postarr Mảng dữ liệu thô gửi từ form.
+	 * @return array
+	 */
+	public function process_post_content_base64_images( $data, $postarr ) {
+		if ( empty( $data['post_content'] ) || false === strpos( $data['post_content'], 'data:image/' ) ) {
+			return $data;
+		}
+
+		if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+			return $data;
+		}
+
+		$post_id = ! empty( $postarr['ID'] ) ? absint( $postarr['ID'] ) : 0;
+		if ( $post_id > 0 && ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) ) {
+			return $data;
+		}
+
+		if ( ! current_user_can( 'upload_files' ) ) {
+			return $data;
+		}
+
+		if ( ! (bool) get_option( 'smart_paste_enable_editor', 1 ) ) {
+			return $data;
+		}
+
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+		require_once ABSPATH . 'wp-admin/includes/image.php';
+		require_once ABSPATH . 'wp-admin/includes/media.php';
+
+		$post_title     = ! empty( $data['post_title'] ) ? $data['post_title'] : ( ! empty( $postarr['post_title'] ) ? $postarr['post_title'] : '' );
+		$naming_scheme  = get_option( 'smart_paste_naming_scheme', 'post_title' );
+		$custom_prefix  = get_option( 'smart_paste_custom_prefix', 'pasted-image' );
+		if ( empty( $custom_prefix ) ) {
+			$custom_prefix = 'pasted-image';
+		}
+
+		$convert_format = get_option( 'smart_paste_convert_format', 'webp' );
+		$image_quality  = (int) get_option( 'smart_paste_image_quality', 82 );
+		$auto_alt       = (bool) get_option( 'smart_paste_auto_alt', 1 );
+
+		$allowed_mimes_map = array(
+			'image/jpeg' => '.jpg',
+			'image/png'  => '.png',
+			'image/webp' => '.webp',
+			'image/avif' => '.avif',
+			'image/gif'  => '.gif',
+		);
+
+		// Tìm tất cả các thẻ <img> chứa src="data:image/..."
+		$pattern = '/<img([^>]*?)src=["\'](data:image\/(png|jpe?g|gif|webp|avif);base64,([A-Za-z0-9+\/=\r\n]+))["\']([^>]*?)>/i';
+
+		$img_index = 0;
+		$content = preg_replace_callback( $pattern, function( $matches ) use (
+			&$img_index, $post_id, $post_title, $naming_scheme, $custom_prefix,
+			$convert_format, $image_quality, $auto_alt, $allowed_mimes_map
+		) {
+			$img_index++;
+			$before_attrs = $matches[1];
+			$base64_data  = $matches[4];
+			$after_attrs  = $matches[5];
+
+			$binary_data = base64_decode( preg_replace( '/\s+/', '', $base64_data ) );
+			if ( false === $binary_data || empty( $binary_data ) ) {
+				return $matches[0];
+			}
+
+			// Tạo file tạm an toàn
+			$temp_file = wp_tempnam( 'smart_paste_' );
+			if ( ! $temp_file ) {
+				return $matches[0];
+			}
+			file_put_contents( $temp_file, $binary_data );
+
+			// Xác thực file thực tế
+			$image_info    = @getimagesize( $temp_file );
+			$detected_mime = $image_info ? $image_info['mime'] : '';
+			if ( empty( $detected_mime ) && function_exists( 'finfo_open' ) ) {
+				$finfo         = finfo_open( FILEINFO_MIME_TYPE );
+				$detected_mime = finfo_file( $finfo, $temp_file );
+				finfo_close( $finfo );
+			}
+
+			if ( empty( $detected_mime ) || ! isset( $allowed_mimes_map[ $detected_mime ] ) ) {
+				@unlink( $temp_file );
+				return $matches[0];
+			}
+
+			$ext = $allowed_mimes_map[ $detected_mime ];
+
+			// Chuyển đổi định dạng sang WebP / AVIF
+			if ( 'original' !== $convert_format && in_array( $detected_mime, array( 'image/png', 'image/jpeg', 'image/gif' ), true ) ) {
+				$converted = $this->convert_image_file( $temp_file, $convert_format, $image_quality );
+				if ( $converted && ! empty( $converted['path'] ) && file_exists( $converted['path'] ) ) {
+					if ( $converted['path'] !== $temp_file ) {
+						@unlink( $temp_file );
+					}
+					$temp_file     = $converted['path'];
+					$detected_mime = $converted['mime'];
+					$ext           = $converted['ext'];
+				}
+			}
+
+			// Tạo tên file chuẩn SEO
+			$base_slug = '';
+			if ( 'post_title' === $naming_scheme && ! empty( $post_title ) ) {
+				$base_slug = sanitize_title( $post_title );
+			}
+			if ( empty( $base_slug ) ) {
+				$base_slug = sanitize_title( $custom_prefix );
+			}
+
+			$timestamp     = gmdate( 'Ymd-His' );
+			$random_suffix = wp_generate_password( 4, false, false );
+			$seo_filename  = $base_slug . '-' . $timestamp . '-' . $random_suffix . '-' . $img_index . $ext;
+
+			// Sideload vào WordPress Media Library
+			$file_array = array(
+				'name'     => $seo_filename,
+				'tmp_name' => $temp_file,
+			);
+
+			$uploaded = wp_handle_sideload( $file_array, array( 'test_form' => false ) );
+			if ( isset( $uploaded['error'] ) || empty( $uploaded['file'] ) ) {
+				@unlink( $temp_file );
+				return $matches[0];
+			}
+
+			$file_path = $uploaded['file'];
+			$file_url  = $uploaded['url'];
+			$mime_type = $uploaded['type'];
+
+			$final_title = ! empty( $post_title ) ? $post_title . ' ' . $img_index : ucwords( str_replace( array( '-', '_' ), ' ', $base_slug ) );
+
+			$attachment = array(
+				'post_mime_type' => $mime_type,
+				'post_title'     => $final_title,
+				'post_content'   => '',
+				'post_status'    => 'inherit',
+				'guid'           => $file_url,
+			);
+
+			$attach_id = wp_insert_attachment( $attachment, $file_path, $post_id );
+			if ( is_wp_error( $attach_id ) ) {
+				return $matches[0];
+			}
+
+			$attach_data = wp_generate_attachment_metadata( $attach_id, $file_path );
+			wp_update_attachment_metadata( $attach_id, $attach_data );
+
+			if ( $auto_alt ) {
+				update_post_meta( $attach_id, '_wp_attachment_image_alt', $final_title );
+			}
+			update_post_meta( $attach_id, '_smart_clipboard_pasted', 1 );
+
+			// Tăng bộ đếm
+			$count = (int) get_option( 'smart_paste_total_count', 0 ) + 1;
+			update_option( 'smart_paste_total_count', $count, false );
+
+			// Xóa class tạm smart-paste-pending và thêm class chuẩn WordPress
+			$all_attrs = trim( $before_attrs . ' ' . $after_attrs );
+			$all_attrs = rtrim( $all_attrs, "/> \t\n\r\0\x0B" );
+			$all_attrs = preg_replace( '/\bsmart-paste-pending\b/', '', $all_attrs );
+
+			// Kiểm tra alt
+			if ( false === strpos( $all_attrs, 'alt=' ) ) {
+				$all_attrs .= ' alt="' . esc_attr( $final_title ) . '"';
+			}
+
+			// Đảm bảo class chứa wp-image-{id}
+			if ( preg_match( '/class=["\']([^"\']*)["\']/', $all_attrs, $class_match ) ) {
+				$classes   = trim( preg_replace( '/\s+/', ' ', $class_match[1] . " wp-image-{$attach_id}" ) );
+				$all_attrs = preg_replace( '/class=["\'][^"\']*["\']/', 'class="' . esc_attr( $classes ) . '"', $all_attrs );
+			} else {
+				$all_attrs .= ' class="aligncenter size-full wp-image-' . $attach_id . '"';
+			}
+
+			// Lấy kích thước
+			$meta   = wp_get_attachment_metadata( $attach_id );
+			$width  = ! empty( $meta['width'] ) ? $meta['width'] : 0;
+			$height = ! empty( $meta['height'] ) ? $meta['height'] : 0;
+			if ( $width > 0 && false === strpos( $all_attrs, 'width=' ) ) {
+				$all_attrs .= ' width="' . $width . '"';
+			}
+			if ( $height > 0 && false === strpos( $all_attrs, 'height=' ) ) {
+				$all_attrs .= ' height="' . $height . '"';
+			}
+
+			return '<img src="' . esc_url( $file_url ) . '" ' . trim( $all_attrs ) . ' />';
+		}, $data['post_content'] );
+
+		if ( null !== $content ) {
+			$data['post_content'] = $content;
+		}
+
+		return $data;
+	}
+
+	/**
 	 * Trang Bảng điều khiển & Cài đặt Plugin
 	 */
 	public function render_admin_page() {
@@ -691,7 +900,28 @@ class Smart_Clipboard_Media_Uploader {
 									<input type="checkbox" name="smart_paste_enable_editor" value="1" <?php checked( 1, get_option( 'smart_paste_enable_editor', 1 ) ); ?> />
 									Bật dán ảnh trong Trình soạn thảo (Gutenberg & Classic Editor)
 								</label>
-								<p class="description">Chặn chuỗi Base64 làm phình cơ sở dữ liệu. Tự động tải ảnh vào Thư viện Media và chèn thẻ ảnh chuẩn WordPress tại vị trí con trỏ chuột.</p>
+								<p class="description">Chặn chuỗi Base64 làm phình cơ sở dữ liệu. Hỗ trợ cả Trình soạn thảo Cổ điển (Classic Editor) và Khối (Gutenberg).</p>
+							</td>
+						</tr>
+
+						<tr>
+							<th scope="row">Thời điểm tải ảnh vào Thư viện</th>
+							<td>
+								<fieldset>
+									<label style="display: block; margin-bottom: 8px; font-weight: 600;">
+										<input type="radio" name="smart_paste_editor_mode" value="on_save" <?php checked( 'on_save', get_option( 'smart_paste_editor_mode', 'on_save' ) ); ?> />
+										<span style="color: #16a34a; font-weight: 700;">Chỉ tải lên Thư viện khi Xuất bản / Lưu bài viết (Khuyên dùng)</span>
+									</label>
+									<p class="description" style="margin: 0 0 12px 24px; line-height: 1.6;">
+										Khi dán ảnh vào bài viết, ảnh hiển thị tức thì 0 giây dưới dạng xem trước. Chỉ khi bạn bấm <strong>"Xuất bản"</strong>, <strong>"Cập nhật"</strong> hoặc <strong>"Lưu bản nháp"</strong> thì ảnh mới thực sự được nén WebP và tải vào Thư viện Media. <em>Nếu dán nhầm ảnh và xóa đi thì không hề bị tốn dung lượng hosting!</em>
+									</p>
+
+									<label style="display: block; margin-bottom: 8px; font-weight: 600;">
+										<input type="radio" name="smart_paste_editor_mode" value="instant" <?php checked( 'instant', get_option( 'smart_paste_editor_mode', 'on_save' ) ); ?> />
+										<span>Tải lên Thư viện Media ngay lập tức khi vừa nhấn Ctrl + V</span>
+									</label>
+									<p class="description" style="margin: 0 0 0 24px;">Ảnh sẽ được tải lên thư viện ngay khi vừa dán. Phù hợp nếu bạn muốn ảnh có ID thư viện ngay lập tức trong bài viết.</p>
+								</fieldset>
 							</td>
 						</tr>
 
